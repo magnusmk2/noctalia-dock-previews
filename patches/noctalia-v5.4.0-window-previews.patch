@@ -1,0 +1,710 @@
+diff --git a/src/shell/dock/dock.cpp b/src/shell/dock/dock.cpp
+index a079fd65f2f3c75e583141a259b452736979a1ef..a45146deae47ea91a225747649cfd755e1f71296 100644
+--- a/src/shell/dock/dock.cpp
++++ b/src/shell/dock/dock.cpp
+@@ -7,6 +7,7 @@
+ #include "core/log.h"
+ #include "ipc/ipc_service.h"
+ #include "render/scene/node.h"
++#include "render/scene/input_area.h"
+ #include "shell/dock/dock_context_menu.h"
+ #include "shell/dock/dock_geometry.h"
+ #include "shell/dock/dock_instance.h"
+@@ -506,10 +507,15 @@ bool Dock::onPointerEvent(const PointerEvent& event) {
+   // Route open popups first. Unconsumed presses dismiss the menu; only continue to
+   // dock hit-testing when the press is on the dock itself.
+   if (m_itemMenu != nullptr) {
++    shell::dock::DockPopup* const popup = m_itemMenu.get();
+     const bool consumed = shell::dock::routePopupEvent(*m_itemMenu, event);
+     if (consumed) {
+       return true;
+     }
++    if (popup->hoverPreview && event.type == PointerEvent::Type::Leave && event.surface == popup->wlSurface) {
++      scheduleHoverPreviewDismiss(popup);
++      return true;
++    }
+     if (event.type == PointerEvent::Type::Button && event.pressed) {
+       closeItemMenu();
+       if (event.surface == nullptr || !m_surfaceMap.contains(event.surface)) {
+@@ -565,6 +571,14 @@ bool Dock::onPointerEvent(const PointerEvent& event) {
+   }
+   case PointerEvent::Type::Leave: {
+     if (m_hoveredInstance != nullptr) {
++      shell::dock::DockInstance* const leaving = m_hoveredInstance;
++      shell::dock::DockPopup* const popup = m_itemMenu.get();
++      if (popup != nullptr && popup->hoverPreview && m_popupOwnerInstance == leaving) {
++        scheduleHoverPreviewDismiss(popup);
++      }
++      m_hoveredInstance->hoverPreviewTimer.stop();
++      m_hoveredInstance->hoverPreviewIndex.reset();
++      m_hoveredInstance->hoverPreviewSwitchPending = false;
+       if (m_hoveredInstance->drag.active || m_hoveredInstance->drag.armed) {
+         endDrag(*m_hoveredInstance, false);
+       }
+@@ -647,6 +661,10 @@ bool Dock::onPointerEvent(const PointerEvent& event) {
+     }
+   }
+ 
++  if (m_hoveredInstance != nullptr) {
++    updateHoverPreview(*m_hoveredInstance);
++  }
++
+   return m_hoveredInstance != nullptr;
+ }
+ 
+@@ -1081,6 +1099,15 @@ void Dock::endDrag(shell::dock::DockInstance& instance, bool commit) {
+   });
+ }
+ 
++void Dock::scheduleHoverPreviewDismiss(shell::dock::DockPopup* popup) {
++  DeferredCall::callLater([this, popup]() {
++    if (m_itemMenu.get() == popup && m_platform != nullptr
++        && (!m_platform->hasPointerPosition() || m_platform->lastPointerSurface() != popup->wlSurface)) {
++      closeItemMenu();
++    }
++  });
++}
++
+ void Dock::closeItemMenu() {
+   shell::dock::DockInstance* owner = m_popupOwnerInstance;
+   m_popupOwnerInstance = nullptr;
+@@ -1310,6 +1337,127 @@ void Dock::openItemMenu(shell::dock::DockInstance& instance, const shell::dock::
+   }
+ }
+ 
++void Dock::updateHoverPreview(shell::dock::DockInstance& instance) {
++  if (m_itemMenu != nullptr && !m_itemMenu->hoverPreview) {
++    return;
++  }
++  if (!instance.pointerInside || instance.drag.active || instance.drag.armed) {
++    instance.hoverPreviewTimer.stop();
++    instance.hoverPreviewIndex.reset();
++    return;
++  }
++  InputArea* hovered = instance.inputDispatcher.hoveredArea();
++  const auto it = std::ranges::find_if(instance.items, [hovered](const auto& item) { return item.area == hovered; });
++  if (it == instance.items.end() || !it->action.has_value()) {
++    instance.hoverPreviewTimer.stop();
++    instance.hoverPreviewIndex.reset();
++    if (m_itemMenu != nullptr && m_itemMenu->hoverPreview && m_popupOwnerInstance == &instance) {
++      instance.hoverPreviewSwitchPending = true;
++      closeItemMenu();
++    }
++    return;
++  }
++  const std::size_t index = static_cast<std::size_t>(std::distance(instance.items.begin(), it));
++  if (instance.hoverPreviewIndex == index) {
++    return;
++  }
++  instance.hoverPreviewTimer.stop();
++  instance.hoverPreviewIndex = index;
++  const auto action = *it->action;
++  if (m_itemMenu != nullptr) {
++    if (m_popupOwnerInstance == &instance && m_itemMenu->sourceDockItemIndex == index) {
++      return;
++    }
++    instance.hoverPreviewSwitchPending = false;
++    if (m_popupOwnerInstance != &instance) {
++      closeItemMenu();
++    }
++    if (m_itemMenu == nullptr) {
++      // Switching between icons can pass through the dock's gaps. Preserve the
++      // immediate handoff even though the previous popup was dismissed there.
++      instance.hoverPreviewSwitchPending = true;
++    } else {
++      DeferredCall::callLater([this, owner = &instance, index, action]() {
++        if (owner != m_hoveredInstance || !owner->pointerInside || m_itemMenu == nullptr
++            || !m_itemMenu->hoverPreview || index >= owner->items.size()
++            || owner->inputDispatcher.hoveredArea() != owner->items[index].area) {
++          return;
++        }
++        openWindowPreview(*owner, action, index);
++      });
++      return;
++    }
++  }
++  if (instance.hoverPreviewSwitchPending) {
++    instance.hoverPreviewSwitchPending = false;
++    DeferredCall::callLater([this, owner = &instance, index, action]() {
++      if (owner != m_hoveredInstance || !owner->pointerInside || m_itemMenu != nullptr
++          || index >= owner->items.size() || owner->inputDispatcher.hoveredArea() != owner->items[index].area) {
++        return;
++      }
++      openWindowPreview(*owner, action, index);
++    });
++    return;
++  }
++  instance.hoverPreviewTimer.start(std::chrono::milliseconds(850), [this, owner = &instance, index, action]() {
++    if (owner != m_hoveredInstance
++        || !owner->pointerInside
++        || m_itemMenu != nullptr
++        || index >= owner->items.size()
++        || owner->inputDispatcher.hoveredArea() != owner->items[index].area) {
++      return;
++    }
++    openWindowPreview(*owner, action, index);
++  });
++}
++
++void Dock::openWindowPreview(
++    shell::dock::DockInstance& instance, const shell::dock::DockItemAction& action, std::size_t itemIndex
++) {
++  assertDockInitialized(m_platform, m_config, m_renderContext);
++  closeItemMenu();
++  auto windows = shell::dock::windowsForDockItem(
++      *m_platform, action.windowLookupIdLower, action.windowLookupWmClassLower,
++      shell::dock::dockFilterOutput(instance.config, instance.output)
++  );
++  if (windows.empty()) {
++    return;
++  }
++  float anchorCenterX = static_cast<float>(m_platform->lastPointerX());
++  float anchorCenterY = static_cast<float>(m_platform->lastPointerY());
++  if (itemIndex < instance.items.size() && instance.items[itemIndex].area != nullptr) {
++    float areaX = 0.0F;
++    float areaY = 0.0F;
++    Node::absolutePosition(instance.items[itemIndex].area, areaX, areaY);
++    anchorCenterX = areaX + instance.items[itemIndex].area->width() * 0.5F;
++    anchorCenterY = areaY + instance.items[itemIndex].area->height() * 0.5F;
++  }
++  m_popupOwnerInstance = &instance;
++  auto* layerSurface =
++      instance.surface != nullptr ? m_platform->layerSurfaceFor(instance.surface->wlSurface()) : nullptr;
++  m_itemMenu = shell::dock::createWindowPreview(
++      *m_platform, *m_config, *m_renderContext, layerSurface, instance.output, instance.config, anchorCenterX,
++      anchorCenterY, action.entry, std::move(windows),
++      [this](std::size_t index) {
++        if (m_platform != nullptr && m_itemMenu != nullptr && index < m_itemMenu->windows.size()) {
++          m_platform->activateToplevelInfo(m_itemMenu->windows[index]);
++        }
++      },
++      [this](std::size_t index) {
++        if (m_platform != nullptr && m_itemMenu != nullptr && index < m_itemMenu->windows.size()) {
++          m_platform->closeToplevelInfo(m_itemMenu->windows[index]);
++        }
++      },
++      [this]() { closeItemMenu(); }
++  );
++  if (m_itemMenu != nullptr) {
++    m_itemMenu->sourceDockItemIndex = itemIndex;
++  }
++  if (m_itemMenu == nullptr) {
++    m_popupOwnerInstance = nullptr;
++  }
++}
++
+ void Dock::registerIpc(IpcService& ipc) {
+   ipc.bind(noctalia::cli::msg::dockShow, [this](const std::string&) -> std::string {
+     if (m_config)
+diff --git a/src/shell/dock/dock.h b/src/shell/dock/dock.h
+index d4a268eea52ece1657c5dc665417deb05a05bf99..bcee244387871c4d9b9104c9527ab6112a7bf377 100644
+--- a/src/shell/dock/dock.h
++++ b/src/shell/dock/dock.h
+@@ -68,6 +68,11 @@ private:
+   void activateOrLaunchItem(shell::dock::DockInstance& instance, const shell::dock::DockItemAction& action);
+   void tryFulfillPendingLaunchFocus();
+   void openItemMenu(shell::dock::DockInstance& instance, const shell::dock::DockItemAction& action);
++  void updateHoverPreview(shell::dock::DockInstance& instance);
++  void openWindowPreview(
++      shell::dock::DockInstance& instance, const shell::dock::DockItemAction& action, std::size_t itemIndex
++  );
++  void scheduleHoverPreviewDismiss(shell::dock::DockPopup* popup);
+   void closeItemMenu();
+   void beginDrag(shell::dock::DockInstance& instance, std::size_t index, float mainPos);
+   void updateDrag(shell::dock::DockInstance& instance, float mainPos);
+diff --git a/src/shell/dock/dock_context_menu.cpp b/src/shell/dock/dock_context_menu.cpp
+index 6cbfbb6cfcb27bdbe61bcd30d90c1f2de567d3a4..a4e98876508a76eba3341c6fd40f080abe657b8c 100644
+--- a/src/shell/dock/dock_context_menu.cpp
++++ b/src/shell/dock/dock_context_menu.cpp
+@@ -1,19 +1,25 @@
+ #include "shell/dock/dock_context_menu.h"
+ 
++#include "capture/screencopy_capture.h"
+ #include "compositors/compositor_detect.h"
+ #include "compositors/compositor_platform.h"
+ #include "config/config_service.h"
+ #include "core/deferred_call.h"
+ #include "core/log.h"
+ #include "core/ui_phase.h"
++#include "ext-foreign-toplevel-list-v1-client-protocol.h"
+ #include "i18n/i18n.h"
++#include "render/core/texture_manager.h"
+ #include "render/render_context.h"
+ #include "render/render_target.h"
+ #include "render/scene/node.h"
+ #include "shell/dock/pinned_apps.h"
+ #include "system/desktop_entry.h"
+ #include "ui/builders.h"
++#include "ui/controls/box.h"
+ #include "ui/controls/context_menu.h"
++#include "ui/controls/image.h"
++#include "ui/controls/scroll_view.h"
+ #include "ui/popup_chrome.h"
+ #include "ui/style.h"
+ #include "wayland/popup_surface.h"
+@@ -24,6 +30,8 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <linux/input-event-codes.h>
++#include <utility>
+ 
+ namespace shell::dock {
+   namespace {
+@@ -36,7 +44,6 @@ namespace shell::dock {
+     constexpr std::int32_t kMenuSeparatorId = -3;
+     constexpr std::int32_t kMenuPinToggleId = -4;
+     constexpr std::int32_t kMenuWindowBaseId = -1000;
+-
+     bool isWindowClosable(const ToplevelInfo& window) {
+       if (window.handle != nullptr) {
+         return true;
+@@ -126,6 +133,12 @@ namespace shell::dock {
+       }
+       break;
+     case PointerEvent::Type::Axis:
++      if (onPopup || popup.pointerInside) {
++        consumed = popup.inputDispatcher.pointerAxis(
++            static_cast<float>(event.sx), static_cast<float>(event.sy), event.axis, event.axisSource, event.axisValue,
++            event.axisDiscrete, event.axisValue120, event.axisLines
++        );
++      }
+       break;
+     }
+ 
+@@ -481,4 +494,271 @@ namespace shell::dock {
+     return menu;
+   }
+ 
++  std::unique_ptr<DockPopup> createWindowPreview(
++      CompositorPlatform& platform, ConfigService& config, RenderContext& renderContext,
++      zwlr_layer_surface_v1* parentLayerSurface, wl_output* output, const DockConfig& dockConfig,
++      float anchorCenterX, float anchorCenterY, const DesktopEntry& entry, std::vector<ToplevelInfo> windows,
++      const std::function<void(std::size_t)>& activateWindow, const std::function<void(std::size_t)>& closeWindow,
++      const std::function<void()>& closePreview
++  ) {
++    if (windows.empty() || parentLayerSurface == nullptr || !platform.hasXdgShell()) {
++      return nullptr;
++    }
++    auto preview = std::make_unique<DockPopup>();
++    preview->windows = std::move(windows);
++    preview->hoverPreview = true;
++    constexpr float cardWidth = 196.0F;
++    constexpr float cardHeight = 150.0F;
++    constexpr float imageWidth = cardWidth - 20.0F;
++    constexpr float imageHeight = 104.0F;
++    constexpr float gap = 8.0F;
++    constexpr float pad = 10.0F;
++    const std::size_t visibleCards = std::min<std::size_t>(preview->windows.size(), 3);
++    const float viewportWidth = cardWidth * static_cast<float>(visibleCards)
++        + gap * static_cast<float>(visibleCards > 0 ? visibleCards - 1 : 0);
++    const float width = viewportWidth + pad * 2.0F;
++    const float height = cardHeight + pad * 2.0F;
++    const DockEdge edge = dockConfig.position;
++    const bool bottom = edge == DockEdge::Bottom;
++    const bool top = edge == DockEdge::Top;
++    const bool right = edge == DockEdge::Right;
++    // Keep the preview popup attached to its dock icon. The previous clearance
++    // offset left a narrow dead zone that could close the popup while crossing it.
++    constexpr std::int32_t offset = 0;
++    PopupSurfaceConfig popupCfg{
++        .anchorX = static_cast<std::int32_t>(
++            std::lround(anchorCenterX - static_cast<float>(dockConfig.iconSize) / 2.0F)
++        ),
++        .anchorY = static_cast<std::int32_t>(
++            std::lround(anchorCenterY - static_cast<float>(dockConfig.iconSize) / 2.0F)
++        ),
++        .anchorWidth = std::max(1, dockConfig.iconSize),
++        .anchorHeight = std::max(1, dockConfig.iconSize),
++        .width = static_cast<std::uint32_t>(std::ceil(width)),
++        .height = static_cast<std::uint32_t>(std::ceil(height)),
++        .anchor = bottom ? XDG_POSITIONER_ANCHOR_TOP
++            : top        ? XDG_POSITIONER_ANCHOR_BOTTOM
++            : right      ? XDG_POSITIONER_ANCHOR_LEFT
++                         : XDG_POSITIONER_ANCHOR_RIGHT,
++        .gravity = bottom ? XDG_POSITIONER_GRAVITY_TOP
++            : top         ? XDG_POSITIONER_GRAVITY_BOTTOM
++            : right       ? XDG_POSITIONER_GRAVITY_LEFT
++                          : XDG_POSITIONER_GRAVITY_RIGHT,
++        .constraintAdjustment = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X
++            | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y
++            | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X
++            | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y,
++        .offsetX = right ? -offset : (!bottom && !top ? offset : 0),
++        .offsetY = bottom ? -offset : (top ? offset : 0),
++        .serial = 0,
++        .grab = false,
++    };
++    const auto chrome =
++        popup_chrome::computeGeometry(width, height, config.config().shell.shadow, Style::popupShadowsEnabled());
++    popup_chrome::applyToConfig(popupCfg, chrome, popupAttachmentForDockPosition(bottom, top, right));
++    preview->chrome = chrome;
++    preview->surface = std::make_unique<PopupSurface>(platform.wayland());
++    preview->surface->setRenderContext(&renderContext);
++    auto* raw = preview.get();
++    preview->surface->setConfigureCallback([raw](std::uint32_t, std::uint32_t) { raw->surface->requestLayout(); });
++    const std::string entryName = entry.name;
++    preview->surface->setPrepareFrameCallback(
++        [&platform, &config, &renderContext, raw, activateWindow, closeWindow, closePreview, entryName, cardWidth,
++         cardHeight, imageWidth, imageHeight, gap, pad, dockBackgroundOpacity = dockConfig.backgroundOpacity](bool, bool needsLayout) {
++      if (raw->surface == nullptr || raw->surface->width() == 0 || raw->surface->height() == 0)
++        return;
++      const auto sw = raw->surface->width();
++      const auto sh = raw->surface->height();
++      const bool rebuild = raw->sceneRoot == nullptr
++          || static_cast<std::uint32_t>(std::round(raw->sceneRoot->width())) != sw
++          || static_cast<std::uint32_t>(std::round(raw->sceneRoot->height())) != sh;
++      if (!rebuild && !needsLayout)
++        return;
++      renderContext.makeCurrent(raw->surface->renderTarget());
++      UiPhaseScope phase(UiPhase::Layout);
++      if (!rebuild) {
++        raw->sceneRoot->setSize(static_cast<float>(sw), static_cast<float>(sh));
++        raw->sceneRoot->layout(raw->surface->renderTarget().renderer());
++        return;
++      }
++      raw->sceneRoot = ui::node({});
++      raw->sceneRoot->setSize(static_cast<float>(sw), static_cast<float>(sh));
++      if (Style::popupShadowsEnabled()) {
++        (void)popup_chrome::addShadow(
++            *raw->sceneRoot, raw->chrome, config.config().shell.shadow, Style::scaledRadiusLg()
++        );
++      }
++      if (auto* background = popup_chrome::addCardBackground(*raw->sceneRoot, raw->chrome, 1.0F)) {
++        background->setFill(colorSpecFromRole(ColorRole::Surface, dockBackgroundOpacity));
++      }
++      raw->previewImages.clear();
++      auto scroll = ui::scrollView({
++          .orientation = ScrollOrientation::Horizontal,
++          .scrollbarVisible = true,
++          .viewportPaddingH = 0.0F,
++          .viewportPaddingV = 0.0F,
++          .width = std::max(1.0F, raw->chrome.contentWidth - pad * 2.0F),
++          .height = std::max(1.0F, raw->chrome.contentHeight - pad * 2.0F),
++          .configure = [raw, pad](ScrollView& view) {
++            view.setPosition(raw->chrome.contentX() + pad, raw->chrome.contentY() + pad);
++            view.clearFill();
++            view.clearBorder();
++          },
++      });
++      auto* content = scroll->content();
++      content->setDirection(FlexDirection::Horizontal);
++      content->setGap(gap);
++      for (std::size_t i = 0; i < raw->windows.size(); ++i) {
++        Image* image = nullptr;
++        auto card = ui::flex(
++            FlexDirection::Vertical,
++            {
++                .width = cardWidth,
++                .height = cardHeight,
++                .configure = [](Flex& box) {
++                  box.setDirection(FlexDirection::Vertical);
++                  box.setGap(5.0F);
++                  box.setCardStyle();
++                  box.setPadding(2.0F, 5.0F, 14.0F, 5.0F);
++                  box.setAlign(FlexAlign::Center);
++                  box.setJustify(FlexJustify::Center);
++                },
++            }
++        );
++        const std::string title = raw->windows[i].title.empty() ? entryName : raw->windows[i].title;
++        auto titleRow = ui::flex(
++            FlexDirection::Horizontal,
++            {.align = FlexAlign::Center, .gap = 2.0F, .width = imageWidth, .height = 25.0F}
++        );
++        titleRow->addChild(
++            ui::label({
++                .text = title,
++                .fontSize = Style::fontSizeCaption,
++                .maxLines = 1,
++                .ellipsize = TextEllipsize::End,
++                .flexGrow = 1.0F,
++            })
++        );
++        titleRow->addChild(
++            ui::button({
++                .glyph = "x",
++                .glyphSize = Style::fontSizeCaption,
++                .variant = ButtonVariant::Ghost,
++                .padding = 0.0F,
++                .radius = Style::scaledRadiusSm(),
++                .width = 24.0F,
++                .height = 24.0F,
++                .onClick = [closeWindow, closePreview, i]() {
++                  if (closeWindow)
++                    closeWindow(i);
++                  DeferredCall::callLater(closePreview);
++                },
++            })
++        );
++        card->addChild(std::move(titleRow));
++        card->addChild(
++            ui::image(
++                {.out = &image, .fit = ImageFit::Height, .radius = 5.0F, .width = imageWidth, .height = imageHeight}
++            )
++        );
++        raw->previewImages.push_back(image);
++        auto* cardNode = card.get();
++        auto area = ui::inputArea({
++            .acceptedButtons = InputArea::buttonMask({BTN_LEFT}),
++            .width = cardWidth,
++            .height = cardHeight,
++            .onEnter = [cardNode, image](const InputArea::PointerData&) {
++              cardNode->setFill(colorSpecFromRole(ColorRole::SurfaceContainerHigh));
++              cardNode->setBorder(colorSpecFromRole(ColorRole::Primary, 0.25F), Style::borderWidth);
++              if (image != nullptr)
++                image->setBorder(colorSpecFromRole(ColorRole::Primary, 0.4F), 1.0F);
++            },
++            .onLeave = [cardNode, image]() {
++              cardNode->setFill(colorSpecFromRole(ColorRole::SurfaceContainer));
++              if (Style::cardBordersEnabled())
++                cardNode->setBorder(colorSpecFromRole(ColorRole::OutlineVariant), Style::borderWidth);
++              else
++                cardNode->clearBorder();
++              if (image != nullptr)
++                image->setBorder(clearColorSpec(), 0.0F);
++            },
++            .onClick = [activateWindow, closePreview, i](const InputArea::PointerData& data) {
++              if (data.button == BTN_LEFT && activateWindow) {
++                activateWindow(i);
++                DeferredCall::callLater(closePreview);
++              }
++            },
++        });
++        area->addChild(std::move(card));
++        content->addChild(std::move(area));
++      }
++      raw->sceneRoot->addChild(std::move(scroll));
++      raw->sceneRoot->layout(raw->surface->renderTarget().renderer());
++      raw->inputDispatcher.setSceneRoot(raw->sceneRoot.get());
++      raw->inputDispatcher.setCursorShapeCallback([&platform](std::uint32_t serial, std::uint32_t shape) {
++        platform.setCursorShape(serial, shape);
++      });
++      raw->surface->setSceneRoot(raw->sceneRoot.get());
++      if (raw->thumbnailCapture == nullptr) {
++        raw->thumbnailCapture = std::make_unique<ToplevelThumbnailCapture>(platform.wayland());
++        if (raw->thumbnailCapture->available()) {
++          auto next = std::make_shared<std::function<void()>>();
++          std::size_t index = 0;
++          *next = [raw, next, index, &renderContext]() mutable {
++            if (raw->thumbnailCapture == nullptr || raw->surface == nullptr) {
++              *next = {};
++              return;
++            }
++            while (index < raw->windows.size() && raw->windows[index].extHandle == nullptr)
++              ++index;
++            if (index >= raw->windows.size()) {
++              *next = {};
++              return;
++            }
++            const std::size_t current = index++;
++            raw->thumbnailCapture->capture(
++                raw->windows[current].extHandle, 480, 300,
++                [raw, next, current, &renderContext](
++                    std::optional<ScreencopyImage> captured, std::string error
++                ) {
++                  if (captured && raw->surface != nullptr && current < raw->previewImages.size()) {
++                    renderContext.makeCurrent(raw->surface->renderTarget());
++                    auto& renderer = raw->surface->renderTarget().renderer();
++                    Image* target = raw->previewImages[current];
++                    if (target != nullptr) {
++                      const bool loaded = target->setSourceRaw(
++                          renderer, captured->rgba.data(), captured->rgba.size(), captured->width, captured->height,
++                          captured->width * 4, PixmapFormat::RGBA, true
++                      );
++                      target->setVisible(loaded);
++                      if (!loaded)
++                        kLog.warn("window preview image could not be uploaded for '{}'", raw->windows[current].title);
++                      if (loaded && raw->sceneRoot != nullptr) {
++                        UiPhaseScope captureLayoutPhase(UiPhase::Layout);
++                        raw->sceneRoot->layout(renderer);
++                      }
++                    }
++                    raw->surface->requestRedraw();
++                  } else if (!captured) {
++                    kLog.warn("window preview capture failed for '{}': {}", raw->windows[current].title, error);
++                  }
++                  if (*next)
++                    (*next)();
++                }
++            );
++          };
++          (*next)();
++        }
++      }
++    });
++    preview->surface->setDismissedCallback([closePreview]() { DeferredCall::callLater(closePreview); });
++    if (!preview->surface->initialize(parentLayerSurface, output, popupCfg)) {
++      kLog.warn("dock: failed to create window preview popup");
++      return nullptr;
++    }
++    popup_chrome::setContentInputRegion(*preview->surface, preview->chrome);
++    preview->wlSurface = preview->surface->wlSurface();
++    return preview;
++  }
++
+ } // namespace shell::dock
+diff --git a/src/shell/dock/dock_context_menu.h b/src/shell/dock/dock_context_menu.h
+index a6d2e2a256fda06dbc8a851d3d9915325a87b9ac..2f1b8d694d3a1afe80d1d45e56222c57b35c1dd8 100644
+--- a/src/shell/dock/dock_context_menu.h
++++ b/src/shell/dock/dock_context_menu.h
+@@ -1,15 +1,18 @@
+ #pragma once
+ 
++#include "capture/toplevel_thumbnail_capture.h"
+ #include "render/scene/input_dispatcher.h"
+ #include "ui/popup_chrome.h"
+ 
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ class CompositorPlatform;
+ class ConfigService;
+ class Node;
++class Image;
+ class PopupSurface;
+ class RenderContext;
+ struct DesktopAction;
+@@ -34,8 +37,12 @@ namespace shell::dock {
+     InputDispatcher inputDispatcher;
+     wl_surface* wlSurface = nullptr;
+     bool pointerInside = false;
++    bool hoverPreview = false;
++    std::optional<std::size_t> sourceDockItemIndex;
+     std::vector<zwlr_foreign_toplevel_handle_v1*> handles;
+     std::vector<ToplevelInfo> windows;
++    std::unique_ptr<ToplevelThumbnailCapture> thumbnailCapture;
++    std::vector<Image*> previewImages;
+   };
+ 
+   struct DockMenuCallbacks {
+@@ -56,4 +63,12 @@ namespace shell::dock {
+       const DesktopEntry& entry, const std::vector<ToplevelInfo>& windows, const DockMenuCallbacks& callbacks
+   );
+ 
++  [[nodiscard]] std::unique_ptr<DockPopup> createWindowPreview(
++      CompositorPlatform& platform, ConfigService& config, RenderContext& renderContext,
++      zwlr_layer_surface_v1* parentLayerSurface, wl_output* output, const DockConfig& dockConfig,
++      float anchorCenterX, float anchorCenterY, const DesktopEntry& entry, std::vector<ToplevelInfo> windows,
++      const std::function<void(std::size_t)>& activateWindow, const std::function<void(std::size_t)>& closeWindow,
++      const std::function<void()>& closePreview
++  );
++
+ } // namespace shell::dock
+diff --git a/src/shell/dock/dock_instance.h b/src/shell/dock/dock_instance.h
+index a583328f4163ebe6891d787c0b41f7d3b77d75b7..d0999f9dd53a467f5f7a8fc8d033033f41ceb94b 100644
+--- a/src/shell/dock/dock_instance.h
++++ b/src/shell/dock/dock_instance.h
+@@ -74,6 +74,9 @@ namespace shell::dock {
+     bool smartAutoHidePinnedVisible = false;
+     Signal<>::ScopedConnection paletteConn;
+     bool suppressItemClick = false; // set on press-release when a hold/drag consumed the gesture
++    Timer hoverPreviewTimer;
++    std::optional<std::size_t> hoverPreviewIndex;
++    bool hoverPreviewSwitchPending = false;
+ 
+     // Drag-to-reorder state.
+     struct DragState {
+diff --git a/src/shell/dock/dock_items.cpp b/src/shell/dock/dock_items.cpp
+index 8b627d893b2807a67fd0a7c2af8856713d3d73cc..752e7d5575c4c25c0f8d732f51acefb824798853 100644
+--- a/src/shell/dock/dock_items.cpp
++++ b/src/shell/dock/dock_items.cpp
+@@ -550,6 +550,7 @@ namespace shell::dock {
+           .windowLookupIdLower = model.windowLookupIdLower,
+           .windowLookupWmClassLower = model.windowLookupWmClassLower,
+       };
++      item.action = action;
+ 
+       const float cellMain = iSize + 2.0F * kCellPad;
+       const float cellCross = iSize + 2.0F * kCellPad;
+diff --git a/src/shell/dock/dock_items.h b/src/shell/dock/dock_items.h
+index 569b292c8d272f04919b3b0cb23fbfa4f7ae2836..dba90e103ae463a97d74f55aac1a9960055f0bc3 100644
+--- a/src/shell/dock/dock_items.h
++++ b/src/shell/dock/dock_items.h
+@@ -6,6 +6,7 @@
+ #include <array>
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <string_view>
+ 
+@@ -25,8 +26,17 @@ namespace shell::dock {
+   struct DockInstance;
+   struct DockSnapshot;
+ 
++  struct DockItemAction {
++    DesktopEntry entry;
++    std::string idLower;
++    std::string startupWmClassLower;
++    std::string windowLookupIdLower;
++    std::string windowLookupWmClassLower;
++  };
++
+   struct DockItemView {
+     InputArea* area = nullptr;
++    std::optional<DockItemAction> action;
+     std::array<Box*, 3> dotIndicators{};
+     Box* minimizedIndicator = nullptr;
+     Box* badge = nullptr;
+@@ -45,14 +55,6 @@ namespace shell::dock {
+     AnimationManager::Id opacityAnimId = 0;
+   };
+ 
+-  struct DockItemAction {
+-    DesktopEntry entry;
+-    std::string idLower;
+-    std::string startupWmClassLower;
+-    std::string windowLookupIdLower;
+-    std::string windowLookupWmClassLower;
+-  };
+-
+   struct DockItemModelDependencies {
+     ConfigService& config;
+   };
+diff --git a/src/ui/controls/image.cpp b/src/ui/controls/image.cpp
+index 12193238392d7c959964779931c59850cf7094de..b20c54eee1b3e00817d5b44d5e2ad2e21dee18ed 100644
+--- a/src/ui/controls/image.cpp
++++ b/src/ui/controls/image.cpp
+@@ -939,6 +939,18 @@ void Image::updateLayout() {
+ 
+   const float paddedWidth = std::max(0.0F, width() - m_padding * 2.0F);
+   const float paddedHeight = std::max(0.0F, height() - m_padding * 2.0F);
++  if (m_fit == ImageFit::Height && m_texture.width > 0 && m_texture.height > 0) {
++    // Keep thumbnail height consistent across portrait and landscape sources.
++    // The Image node may extend past this viewport horizontally; Image clips its
++    // children, so only very wide images lose a small amount at the sides.
++    const float imageWidth = paddedHeight * static_cast<float>(m_texture.width) / static_cast<float>(m_texture.height);
++    m_image->setPosition(m_padding + (paddedWidth - imageWidth) * 0.5F, m_padding);
++    m_image->setFrameSize(imageWidth, paddedHeight);
++    m_image->setTextureSize(m_texture.width, m_texture.height);
++    m_image->setFitMode(ImageFitMode::Stretch);
++    return;
++  }
++
+   m_image->setPosition(m_padding, m_padding);
+   m_image->setFrameSize(paddedWidth, paddedHeight);
+   m_image->setTextureSize(m_texture.width, m_texture.height);
+@@ -948,6 +960,9 @@ void Image::updateLayout() {
+   case ImageFit::Cover:
+     mode = ImageFitMode::Cover;
+     break;
++  case ImageFit::Height:
++    mode = ImageFitMode::Stretch;
++    break;
+   case ImageFit::Contain:
+     mode = ImageFitMode::Contain;
+     break;
+diff --git a/src/ui/controls/image.h b/src/ui/controls/image.h
+index 800bc812b33ecbcbe99bef4ff872b9f2e8948ac4..1d2758304839f98955ec2a2f8d32248fb144c42d 100644
+--- a/src/ui/controls/image.h
++++ b/src/ui/controls/image.h
+@@ -19,5 +19,6 @@ enum class PixmapFormat;
+ enum class ImageFit : std::uint8_t {
+   Contain,
+   Cover,
++  Height,
+   Stretch,
+ };
