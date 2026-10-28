@@ -28,3 +28,7 @@ scripts/check-patch.sh /path/to/pristine/noctalia-v5.4.0
 Also run `git diff --check` and build/test the patched Noctalia source before
 submitting. If rebasing to another Noctalia release, update the base commit,
 compatibility notes, and check script together.
+
+For a release, add a `## X.Y.Z` entry to `CHANGELOG.md`, commit it, and push the
+matching `vX.Y.Z` tag. GitHub Actions validates the patch and creates the release
+with the patch file attached.

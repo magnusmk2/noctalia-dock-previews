@@ -1,0 +1,42 @@
+name: Validate patch
+
+on:
+  push:
+    branches:
+      - "**"
+    tags-ignore:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out supported Noctalia base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: noctalia-dev/noctalia
+          ref: 125a30d4f13e86200e704a013d17ac0ed88a8044
+          path: noctalia
+          persist-credentials: false
+      - name: Check patch and release notes
+        run: |
+          bash -n scripts/check-patch.sh scripts/release-notes.sh
+          scripts/check-patch.sh noctalia
+          git -C noctalia apply "$GITHUB_WORKSPACE/patches/noctalia-v5.4.0-window-previews.patch"
+          git -C noctalia diff --check
+          scripts/release-notes.sh v0.1.0 >/dev/null

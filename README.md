@@ -58,6 +58,17 @@ applies. The implementation was built and exercised against that Noctalia
 checkout; its upstream test suite passed (170 tests) during development. This
 does not imply testing across all compositors or Noctalia versions.
 
+GitHub Actions checks the patch against the pinned upstream commit. For future
+releases, pushing a `vX.Y.Z` tag validates that a matching changelog section
+exists, then publishes the patch file as a GitHub Release asset.
+
+## Releases
+
+Add release notes under the matching version heading in `CHANGELOG.md`, commit
+the change, and push a tag such as `v0.2.0`. The release workflow verifies the
+patch before publishing `noctalia-v5.4.0-window-previews.patch`. GitHub also
+provides source archives for the tagged repository automatically.
+
 ## Compatibility and limitations
 
 - Supported base: Noctalia v5.4.0 only. The patch may need adaptation for later
